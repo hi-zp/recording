@@ -78,10 +78,19 @@ function startWebRTC(isOfferer) {
   };
 
   navigator.mediaDevices.getUserMedia({
-    audio: true,
+    audio: {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+      // googEchoCancellation: true,
+      // googNoiseSuppression: true,
+      // googAutoGainControl: true,
+      sampleRate: 16000,
+      // channelCount: 1
+    },
     video: false,
   }).then(stream => {
-    localVideo.srcObject = stream;
+    // localVideo.srcObject = stream;
     // Add your stream to be sent to the conneting peer
     stream.getTracks().forEach(track => pc.addTrack(track, stream));
 
@@ -152,19 +161,28 @@ AudioFactory.prototype._mergeAudio = async function() {
   // const wasmBytes = await response.arrayBuffer();
   // const wasmModule = await WebAssembly.instantiate(wasmBytes);
 
-  const worker = new Worker('encode-processor.js');
+  const worker = new Worker('encode-processor.js', { type: 'module' });
+
+
+  let saved = false;
 
   // 监听Web Worker发送的消息
   worker.onmessage = function(event) {
     const audioBlob = event.data;
+
+    if (saved)  {
+      return;
+    }
     
     // 下载
     const url = URL.createObjectURL(audioBlob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = 'audio' +  Date.now() + '.wav';
+    link.download = 'audio' +  Date.now() + '.mpeg';
     link.click();
     URL.revokeObjectURL(url);
+
+    saved = true
 
     // 将音频数据存储为文件格式
     // 这里可以使用合适的库或技术来进行文件格式的编码和存储
@@ -187,16 +205,16 @@ AudioFactory.prototype._mergeAudio = async function() {
 
     // send to Worker
     workletNode.port.onmessage = (event) => {
-      const data = event.data
-      if (data.type === 'finish') {
-        worker.postMessage(data)
-      }
+      worker.postMessage({
+        type: 'mp3',
+        data: event.data
+      })
     }
 
     // 连接混合器到AudioWorkletNode
     mixerNode.connect(workletNode);
 
     // 连接AudioWorkletNode到AudioContext的输出
-    workletNode.connect(audioContext.destination);
+    // workletNode.connect(audioContext.destination);
   })
 }

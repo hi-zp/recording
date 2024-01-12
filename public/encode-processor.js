@@ -1,4 +1,47 @@
 // 在Web Worker中监听主线程发送的音频数据
+import { createMp3Encoder } from "./wasm-media-encoders/dist/esnext/index.mjs"
+
+self.onmessage = async function(event) {
+  const audioData = event.data.data;
+  const type = event.data.type;
+
+  let blob;
+  if (type === 'original') {
+    blob = createBlobByOriginalAudioSource(audioData);
+  } else if (type === 'mp3') {
+    blob = await convertToMp3Blob(audioData);
+  }
+
+  // 将音频数据存储为文件格式
+  // 这里可以使用合适的库或技术来进行文件格式的编码和存储
+  // 例如，可以使用Web Audio API的AudioBuffer将音频数据转换为WAV格式，然后使用File API将其保存为文件
+  // ...
+
+  blob && self.postMessage(blob);
+};
+
+async function convertToMp3Blob(audioData) {
+  // let encoder = await createMp3Encoder();
+
+  // /* Configure and use the encoder */
+  // encoder.configure({
+  //   sampleRate: 16000,
+  //   channels: 2,
+  //   vbrQuality: 0,
+  // });
+
+  // console.log('audioData', audioData)
+  
+  // const outBuffer = encoder.encode(audioData);
+  // encoder.finalize();
+
+  return new Blob([audioData], { type: 'audio/mpeg' });
+}
+
+function createBlobByOriginalAudioSource(audioData) {
+  const buffer = createWavFile(audioData);
+  return new Blob([buffer], { type: 'audio/mpeg' });
+}
 
 function writeUTFBytes(view, offset, string) {
   var lng = string.length;
@@ -52,24 +95,3 @@ function createWavFile(audioData) {
   return buffer;
 }
 
-self.onmessage = function(event) {
-  const audioData = event.data.data;
-  const buffer = createWavFile(audioData);
-  console.log(buffer)
-  const blob = new Blob([buffer], { type: 'audio/wav' });
-
-  // 将音频数据存储为文件格式
-  // 这里可以使用合适的库或技术来进行文件格式的编码和存储
-  // 例如，可以使用Web Audio API的AudioBuffer将音频数据转换为WAV格式，然后使用File API将其保存为文件
-  // ...
-
-  // 将结果发送回主线程
-  self.postMessage(blob);
-};
-
-// // default path is on the same directory as Mp3LameEncoder.min.js
-// self.Mp3LameEncoderConfig = {
-//   memoryInitializerPrefixURL: "./memory/"
-//   // => changed to javascripts/memory/Mp3LameEncoder.min.js.mem
-// };
-// importScripts("Mp3LameEncoder.min.js");
