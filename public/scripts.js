@@ -16,6 +16,7 @@ const configuration = {
 let room;
 let pc;
 let audioFactory = new AudioFactory();
+let pickSize = 2;
 
 function onSuccess() {};
 function onError(error) {
@@ -85,12 +86,12 @@ function startWebRTC(isOfferer) {
       // googEchoCancellation: true,
       // googNoiseSuppression: true,
       // googAutoGainControl: true,
-      sampleRate: 16000,
+      // sampleRate: 16000,
       // channelCount: 1
     },
     video: false,
   }).then(stream => {
-    // localVideo.srcObject = stream;
+    localVideo.srcObject = stream;
     // Add your stream to be sent to the conneting peer
     stream.getTracks().forEach(track => pc.addTrack(track, stream));
 
@@ -136,7 +137,7 @@ function AudioFactory() {
 
 AudioFactory.prototype.setStream = function(stream) {
   this._streams.push(stream);
-  if (this._streams.length === 1) {
+  if (this._streams.length === pickSize) {
     this._mergeAudio();
   }
 }
@@ -157,22 +158,11 @@ AudioFactory.prototype._mergeAudio = async function() {
     source.connect(mixerNode);
   });
 
-  // const response = await fetch('https://unpkg.com/wasm-media-encoders@0.6.4/wasm/mp3.wasm');
-  // const wasmBytes = await response.arrayBuffer();
-  // const wasmModule = await WebAssembly.instantiate(wasmBytes);
-
   const worker = new Worker('encode-processor.js', { type: 'module' });
-
-
-  let saved = false;
 
   // 监听Web Worker发送的消息
   worker.onmessage = function(event) {
     const audioBlob = event.data;
-
-    if (saved)  {
-      return;
-    }
     
     // 下载
     const url = URL.createObjectURL(audioBlob);
@@ -181,8 +171,6 @@ AudioFactory.prototype._mergeAudio = async function() {
     link.download = 'audio' +  Date.now() + '.mpeg';
     link.click();
     URL.revokeObjectURL(url);
-
-    saved = true
 
     // 将音频数据存储为文件格式
     // 这里可以使用合适的库或技术来进行文件格式的编码和存储
@@ -198,7 +186,6 @@ AudioFactory.prototype._mergeAudio = async function() {
     // 创建AudioWorkletNode
     const workletNode = new AudioWorkletNode(audioContext, 'audio-processor', {
       processorOptions: {
-        // fetch: fetch,
         // wasmInstance: wasmModule.instance
       }
     });

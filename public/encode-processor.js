@@ -1,5 +1,4 @@
 // 在Web Worker中监听主线程发送的音频数据
-import { createMp3Encoder } from "./wasm-media-encoders/dist/esnext/index.mjs"
 
 self.onmessage = async function(event) {
   const audioData = event.data.data;
@@ -12,29 +11,10 @@ self.onmessage = async function(event) {
     blob = await convertToMp3Blob(audioData);
   }
 
-  // 将音频数据存储为文件格式
-  // 这里可以使用合适的库或技术来进行文件格式的编码和存储
-  // 例如，可以使用Web Audio API的AudioBuffer将音频数据转换为WAV格式，然后使用File API将其保存为文件
-  // ...
-
   blob && self.postMessage(blob);
 };
 
 async function convertToMp3Blob(audioData) {
-  // let encoder = await createMp3Encoder();
-
-  // /* Configure and use the encoder */
-  // encoder.configure({
-  //   sampleRate: 16000,
-  //   channels: 2,
-  //   vbrQuality: 0,
-  // });
-
-  // console.log('audioData', audioData)
-  
-  // const outBuffer = encoder.encode(audioData);
-  // encoder.finalize();
-
   return new Blob([audioData], { type: 'audio/mpeg' });
 }
 
