@@ -1,0 +1,16 @@
+{
+  "name": "audio_merge_push",
+  "version": "1.0.0",
+  "description": "",
+  "main": "scripts.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "express": "^4.18.2",
+    "unfetch": "^5.0.0",
+    "wasm-media-encoders": "^0.6.4"
+  }
+}
