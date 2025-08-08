@@ -11,6 +11,9 @@ class AudioFactory {
   private _context: AudioContext | null = null;
   private _worker: Worker | null = null;
   private _workletNode: AudioWorkletNode | null = null;
+  private _onEncoderReady: ((sampleRate: number) => void) | null = null;
+  private _onAudioContextReady: ((sampleRate: number) => void) | null = null;
+  private _onWorkerChunk: ((blob: Blob) => void) | null = null;
 
   setStream(stream: MediaStream) {
     this._streams.push(stream);
@@ -19,11 +22,24 @@ class AudioFactory {
     }
   }
 
+  setOnEncoderReady(cb: (sampleRate: number) => void) {
+    this._onEncoderReady = cb;
+  }
+
+  setOnAudioContextReady(cb: (sampleRate: number) => void) {
+    this._onAudioContextReady = cb;
+  }
+
+  setOnWorkerChunk(cb: (blob: Blob) => void) {
+    this._onWorkerChunk = cb;
+  }
+
   async _startProcessing() {
     try {
       const audioContext = new AudioContext({ sampleRate: 16000 });
       const actualSampleRate = audioContext.sampleRate;
       this._context = audioContext;
+      this._onAudioContextReady?.(actualSampleRate);
 
       const mixerNode = audioContext.createGain();
 
@@ -39,6 +55,7 @@ class AudioFactory {
       worker.onmessage = (event) => {
         const audioBlob: Blob | null = event.data;
         if (!audioBlob) return;
+        this._onWorkerChunk?.(audioBlob);
         const url = URL.createObjectURL(audioBlob);
         const link = document.createElement('a');
         link.href = url;
@@ -57,7 +74,9 @@ class AudioFactory {
       workletNode.port.onmessage = (event) => {
         if (!this._worker) return;
         if (event.data?.type === 'encoder-ready') {
-          this._worker.postMessage({ type: 'config', sampleRate: event.data.sampleRate });
+          const sr = event.data.sampleRate;
+          this._onEncoderReady?.(sr);
+          this._worker.postMessage({ type: 'config', sampleRate: sr });
         } else {
           this._worker.postMessage({ type: 'mp3', data: event.data });
         }
@@ -94,6 +113,27 @@ export default function RTCClient({ room }: RTCClientProps) {
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
   const [status, setStatus] = useState('Waiting for connection...');
+  const [localState, setLocalState] = useState<{
+    micGranted: boolean;
+    deviceReady: boolean;
+    streamActive: boolean;
+    sampleRate?: number;
+    micLevel?: number;
+  }>({ micGranted: false, deviceReady: false, streamActive: false });
+  const [remoteState, setRemoteState] = useState<{
+    streamActive: boolean;
+  }>({ streamActive: false });
+  const [rtcState, setRtcState] = useState<{
+    signaling: 'idle' | 'open' | 'error';
+    pcState?: RTCPeerConnectionState;
+    iceState?: RTCIceConnectionState;
+    pendingCandidates: number;
+  }>({ signaling: 'idle', pendingCandidates: 0 });
+  const [encodeState, setEncodeState] = useState<{
+    contextSampleRate?: number;
+    encoderSampleRate?: number;
+    chunkCount: number;
+  }>({ chunkCount: 0 });
   const [scaleDroneLoaded, setScaleDroneLoaded] = useState(false);
   const [permissionGranted, setPermissionGranted] = useState(false);
   const [permissionDenied, setPermissionDenied] = useState(false);
@@ -104,6 +144,22 @@ export default function RTCClient({ room }: RTCClientProps) {
   const droneRef = useRef<any>(null);
   const roomRef = useRef<any>(null);
   const pendingRemoteCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
+  // 本地音量检测相关
+  const meterCtxRef = useRef<AudioContext | null>(null);
+  const meterAnalyserRef = useRef<AnalyserNode | null>(null);
+  const meterRafRef = useRef<number | null>(null);
+  const cleanupMeter = () => {
+    if (meterRafRef.current) {
+      cancelAnimationFrame(meterRafRef.current);
+      meterRafRef.current = null;
+    }
+    try { meterAnalyserRef.current?.disconnect(); } catch {}
+    meterAnalyserRef.current = null;
+    if (meterCtxRef.current) {
+      try { meterCtxRef.current.close(); } catch {}
+      meterCtxRef.current = null;
+    }
+  };
 
   // 计算房间链接
   useEffect(() => {
@@ -115,6 +171,9 @@ export default function RTCClient({ room }: RTCClientProps) {
   // 初始化AudioFactory
   useEffect(() => {
     const factory = new AudioFactory();
+    factory.setOnAudioContextReady((sr) => setEncodeState((s) => ({ ...s, contextSampleRate: sr })));
+    factory.setOnEncoderReady((sr) => setEncodeState((s) => ({ ...s, encoderSampleRate: sr })));
+    factory.setOnWorkerChunk(() => setEncodeState((s) => ({ ...s, chunkCount: s.chunkCount + 1 })));
     audioFactoryRef.current = factory;
     return () => factory.cleanup();
   }, [room]);
@@ -123,11 +182,19 @@ export default function RTCClient({ room }: RTCClientProps) {
   const requestPermission = async () => {
     try {
       setStatus('Requesting microphone permission...');
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      // 优先同时请求麦克风与摄像头权限
+      let stream: MediaStream | null = null;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+      } catch (_) {
+        // 回退仅麦克风
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      }
       stream.getTracks().forEach((t) => t.stop());
       setPermissionGranted(true);
       setPermissionDenied(false);
-      setStatus('Microphone permission granted');
+      setStatus('Media permission granted');
+      setLocalState((s) => ({ ...s, micGranted: true }));
     } catch (error: any) {
       setPermissionDenied(true);
       setStatus(error?.name === 'NotAllowedError' ? 'Permission denied' : `Permission error: ${error?.message || 'Unknown'}`);
@@ -142,6 +209,7 @@ export default function RTCClient({ room }: RTCClientProps) {
   const checkAudioDevices = async () => {
     if (!navigator.mediaDevices?.getUserMedia) {
       setStatus('Browser does not support audio capture');
+      setLocalState((s) => ({ ...s, deviceReady: false }));
       return false;
     }
     if (navigator.permissions) {
@@ -149,6 +217,7 @@ export default function RTCClient({ room }: RTCClientProps) {
         const mic = await navigator.permissions.query({ name: 'microphone' as PermissionName });
         if (mic.state === 'denied') {
           setStatus('Microphone permission denied');
+          setLocalState((s) => ({ ...s, deviceReady: false }));
           return false;
         }
       } catch (_) {}
@@ -157,8 +226,10 @@ export default function RTCClient({ room }: RTCClientProps) {
     const inputs = devices.filter((d) => d.kind === 'audioinput');
     if (inputs.length === 0) {
       setStatus('No audio input device');
+      setLocalState((s) => ({ ...s, deviceReady: false }));
       return false;
     }
+    setLocalState((s) => ({ ...s, deviceReady: true }));
     return true;
   };
 
@@ -206,6 +277,7 @@ export default function RTCClient({ room }: RTCClientProps) {
 
       pc.onconnectionstatechange = () => {
         const state = pc.connectionState;
+        setRtcState((s) => ({ ...s, pcState: state }));
         if (state === 'connected') setStatus('Peer connected');
       };
 
@@ -221,6 +293,7 @@ export default function RTCClient({ room }: RTCClientProps) {
           remoteVideoRef.current.srcObject = stream;
           audioFactory?.setStream(stream);
           setStatus('Remote audio stream connected');
+          setRemoteState({ streamActive: true });
         }
       };
 
@@ -237,10 +310,16 @@ export default function RTCClient({ room }: RTCClientProps) {
                 sampleRate: { ideal: 16000 },
                 channelCount: { ideal: 2 },
               },
-              video: false,
+              video: {
+                width: { ideal: 1280 },
+                height: { ideal: 720 },
+                frameRate: { ideal: 30 },
+                facingMode: 'user',
+              },
             });
           } catch (_) {
-            stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+            // 回退：仅音频
+            stream = await navigator.mediaDevices.getUserMedia({ audio: true });
           }
           const audioTracks = stream.getAudioTracks();
           if (audioTracks.length === 0) throw new Error('No audio track found');
@@ -248,6 +327,40 @@ export default function RTCClient({ room }: RTCClientProps) {
           stream.getTracks().forEach((track) => pc.addTrack(track, stream));
           audioFactory?.setStream(stream);
           setStatus('Local audio stream connected');
+          setLocalState((s) => ({ ...s, streamActive: true }));
+
+          // 启动本地麦克风音量检测
+          try {
+            cleanupMeter();
+            const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+            const source = ctx.createMediaStreamSource(stream);
+            const analyser = ctx.createAnalyser();
+            analyser.fftSize = 512;
+            analyser.smoothingTimeConstant = 0.2;
+            source.connect(analyser);
+            meterCtxRef.current = ctx;
+            meterAnalyserRef.current = analyser;
+            const data = new Uint8Array(analyser.fftSize);
+            const tick = () => {
+              if (!meterAnalyserRef.current) return;
+              meterAnalyserRef.current.getByteTimeDomainData(data);
+              // 计算归一化音量（0-1）
+              let sum = 0;
+              for (let i = 0; i < data.length; i++) {
+                const v = (data[i] - 128) / 128; // -1..1
+                sum += v * v;
+              }
+              const rms = Math.sqrt(sum / data.length);
+              // 提升可视灵敏度并限制最大值
+              const level = Math.min(1, rms * 2.5);
+              setLocalState((s) => ({ ...s, micLevel: level }));
+              meterRafRef.current = requestAnimationFrame(tick);
+            };
+            meterRafRef.current = requestAnimationFrame(tick);
+          } catch (e) {
+            // eslint-disable-next-line no-console
+            console.warn('Mic level meter init failed:', e);
+          }
         } catch (error: any) {
           setStatus(`Audio device error: ${error?.message || 'Unknown'}`);
           onError(error);
@@ -262,9 +375,11 @@ export default function RTCClient({ room }: RTCClientProps) {
         // eslint-disable-next-line no-console
         console.error('Scaledrone open error', error);
         setStatus('Signaling connection failed');
+        setRtcState((s) => ({ ...s, signaling: 'error' }));
         return;
       }
       setStatus('Signaling connection successful');
+      setRtcState((s) => ({ ...s, signaling: 'open' }));
 
       const roomObj = drone.subscribe(roomName);
       roomRef.current = roomObj;
@@ -301,6 +416,7 @@ export default function RTCClient({ room }: RTCClientProps) {
         } else if (message?.candidate) {
           if (!pc.remoteDescription) {
             pendingRemoteCandidatesRef.current.push(message.candidate);
+            setRtcState((s) => ({ ...s, pendingCandidates: pendingRemoteCandidatesRef.current.length }));
           } else {
             pc.addIceCandidate(new RTCIceCandidate(message.candidate)).catch(onError);
           }
@@ -312,6 +428,7 @@ export default function RTCClient({ room }: RTCClientProps) {
     return () => {
       pcRef.current?.close();
       try { droneRef.current?.close?.(); } catch (_) {}
+      cleanupMeter();
     };
   };
 
@@ -360,15 +477,33 @@ export default function RTCClient({ room }: RTCClientProps) {
               )}
 
               {permissionGranted && (
-                <div className="flex items-center space-x-2">
-                  <svg className="w-5 h-5 text-green-500" fill="currentColor" viewBox="0 0 20 20">
-                    <path
-                      fillRule="evenodd"
-                      d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z"
-                      clipRule="evenodd"
-                    />
-                  </svg>
-                  <span className="text-sm font-medium text-green-600">Microphone Authorized</span>
+                <div className="flex items-center space-x-4 text-xs text-gray-600">
+                  <div className="flex items-center space-x-1">
+                    <span className="font-semibold">Signaling</span>
+                    <span className={rtcState.signaling === 'open' ? 'text-green-600' : rtcState.signaling === 'error' ? 'text-red-600' : 'text-yellow-600'}>
+                      {rtcState.signaling}
+                    </span>
+                  </div>
+                  <div className="flex items-center space-x-1">
+                    <span className="font-semibold">PC</span>
+                    <span className="text-blue-600">{rtcState.pcState || 'idle'}</span>
+                  </div>
+                  <div className="flex items-center space-x-1">
+                    <span className="font-semibold">ICEQ</span>
+                    <span className="text-blue-600">{rtcState.pendingCandidates}</span>
+                  </div>
+                  <div className="flex items-center space-x-1">
+                    <span className="font-semibold">CtxSR</span>
+                    <span className="text-purple-600">{encodeState.contextSampleRate || '-'}</span>
+                  </div>
+                  <div className="flex items-center space-x-1">
+                    <span className="font-semibold">EncSR</span>
+                    <span className="text-purple-600">{encodeState.encoderSampleRate || '-'}</span>
+                  </div>
+                  <div className="flex items-center space-x-1">
+                    <span className="font-semibold">Chunks</span>
+                    <span className="text-purple-600">{encodeState.chunkCount}</span>
+                  </div>
                 </div>
               )}
             </div>
@@ -404,12 +539,45 @@ export default function RTCClient({ room }: RTCClientProps) {
               <h3 className="text-lg font-semibold text-gray-800 mb-3">Local Audio</h3>
               <video ref={localVideoRef} autoPlay muted className="w-full h-32 bg-gray-100 rounded border-2 border-gray-200" />
               <p className="text-sm text-gray-500 mt-2">Your audio stream</p>
+              <div className="mt-3 text-xs text-gray-600 flex flex-wrap gap-3">
+                <div className="flex items-center space-x-1">
+                  <span className="font-semibold">Mic</span>
+                  <span className={localState.micGranted ? 'text-green-600' : 'text-red-600'}>
+                    {localState.micGranted ? 'granted' : 'denied'}
+                  </span>
+                </div>
+                <div className="flex items-center space-x-1">
+                  <span className="font-semibold">Device</span>
+                  <span className={localState.deviceReady ? 'text-green-600' : 'text-yellow-600'}>
+                    {localState.deviceReady ? 'ready' : 'checking'}
+                  </span>
+                </div>
+                <div className="flex items-center space-x-1">
+                  <span className="font-semibold">Local</span>
+                  <span className={localState.streamActive ? 'text-green-600' : 'text-yellow-600'}>
+                    {localState.streamActive ? 'streaming' : 'idle'}
+                  </span>
+                </div>
+              </div>
+            {/* 音量条 */}
+            <div className="mt-2 h-2 bg-gray-200 rounded">
+              <div
+                className="h-2 bg-green-500 rounded transition-[width] duration-75"
+                style={{ width: `${Math.round(((localState.micLevel || 0) * 100))}%` }}
+              />
+            </div>
             </div>
 
             <div className="bg-white rounded-lg shadow p-4">
               <h3 className="text-lg font-semibold text-gray-800 mb-3">Remote Audio</h3>
               <video ref={remoteVideoRef} autoPlay muted className="w-full h-32 bg-gray-100 rounded border-2 border-gray-200" />
               <p className="text-sm text-gray-500 mt-2">Remote audio stream</p>
+              <div className="mt-3 text-xs text-gray-600 flex items-center space-x-2">
+                <span className="font-semibold">Remote</span>
+                <span className={remoteState.streamActive ? 'text-green-600' : 'text-yellow-600'}>
+                  {remoteState.streamActive ? 'streaming' : 'idle'}
+                </span>
+              </div>
             </div>
           </div>
         </div>
