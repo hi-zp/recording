@@ -144,7 +144,11 @@ AudioFactory.prototype.setStream = function(stream) {
 
 AudioFactory.prototype._mergeAudio = async function() {
   // create AudioContext
-  const audioContext = new AudioContext();
+  const audioContext = new AudioContext({ sampleRate: 16000 });
+  
+  // 记录实际的采样率
+  const actualSampleRate = audioContext.sampleRate;
+  console.log("AudioContext sample rate:", actualSampleRate);
 
   this._streams.forEach((stream) => {
     this._sources.push(audioContext.createMediaStreamSource(stream));
@@ -183,19 +187,28 @@ AudioFactory.prototype._mergeAudio = async function() {
 
   audioContext.audioWorklet.addModule('audio-processor.js').then(() => {
 
-    // 创建AudioWorkletNode
+    // 创建AudioWorkletNode - 传递采样率信息
     const workletNode = new AudioWorkletNode(audioContext, 'audio-processor', {
       processorOptions: {
-        // wasmInstance: wasmModule.instance
+        sampleRate: actualSampleRate
       }
     });
 
     // send to Worker
     workletNode.port.onmessage = (event) => {
-      worker.postMessage({
-        type: 'mp3',
-        data: event.data
-      })
+      if (event.data.type === 'encoder-ready') {
+        console.log("Encoder ready with sample rate:", event.data.sampleRate);
+        // 将采样率信息发送给Worker
+        worker.postMessage({
+          type: 'config',
+          sampleRate: event.data.sampleRate
+        });
+      } else {
+        worker.postMessage({
+          type: 'mp3',
+          data: event.data
+        });
+      }
     }
 
     // 连接混合器到AudioWorkletNode
