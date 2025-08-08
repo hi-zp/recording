@@ -147,6 +147,7 @@ export default function RTCClient({ room }: RTCClientProps) {
   const audioFactoryRef = useRef<AudioFactory | null>(null);
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
+  const didApplyInitialSelectedMicRef = useRef<boolean>(false);
   const droneRef = useRef<any>(null);
   const roomRef = useRef<any>(null);
   const pendingRemoteCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
@@ -210,6 +211,20 @@ export default function RTCClient({ room }: RTCClientProps) {
       return undefined;
     }
   }, [permissionGranted]);
+
+  // 设备枚举完成后，若本地轨道未使用所选麦克风，则自动对齐一次
+  useEffect(() => {
+    const stream = localStreamRef.current;
+    if (!stream || !selectedMicId || didApplyInitialSelectedMicRef.current === true) return;
+    const track = stream.getAudioTracks()[0];
+    if (!track) return;
+    const settings = (track.getSettings && track.getSettings()) || {};
+    const currentDeviceId = (settings as any).deviceId as string | undefined;
+    if (!currentDeviceId || currentDeviceId !== selectedMicId) {
+      didApplyInitialSelectedMicRef.current = true;
+      updateLocalTracks('audio');
+    }
+  }, [selectedMicId]);
 
   // 根据选择构建约束
   const buildGumConstraints = () => {
@@ -285,6 +300,13 @@ export default function RTCClient({ room }: RTCClientProps) {
       const newAudio = newStream.getAudioTracks()[0] || null;
       const newVideo = newStream.getVideoTracks()[0] || null;
 
+      // 提示浏览器进行语音优化
+      try {
+        if (newAudio && 'contentHint' in newAudio) {
+          (newAudio as any).contentHint = 'speech';
+        }
+      } catch {}
+
       // 替换发送端轨道
       if (pc) {
         const senders = pc.getSenders();
@@ -346,6 +368,27 @@ export default function RTCClient({ room }: RTCClientProps) {
           console.warn('restart meter failed', e);
         }
       }
+
+      // 监听新音频轨道的静音状态并尝试恢复
+      try {
+        if (newAudio) {
+          const onMute = () => {
+            // 延迟片刻以避免瞬时静音误判
+            setTimeout(() => {
+              // 若仍在使用该轨并且静音，尝试重置采集
+              if (localStreamRef.current?.getAudioTracks()[0] === newAudio && newAudio.muted) {
+                updateLocalTracks('audio');
+              }
+            }, 800);
+          };
+          newAudio.addEventListener('mute', onMute);
+          // 清理旧监听
+          const oldAudio = oldStream?.getAudioTracks()[0];
+          if (oldAudio) {
+            try { oldAudio.removeEventListener('mute', onMute as any); } catch {}
+          }
+        }
+      } catch {}
 
       // 让编码工厂使用最新的本地/远端流
       const remoteStream = (remoteVideoRef.current?.srcObject || null) as MediaStream | null;
@@ -504,6 +547,12 @@ export default function RTCClient({ room }: RTCClientProps) {
         const stream = event.streams[0];
         if (remoteVideoRef.current && (!remoteVideoRef.current.srcObject || (remoteVideoRef.current.srcObject as MediaStream).id !== stream.id)) {
           remoteVideoRef.current.srcObject = stream;
+          // 尝试自动播放远端音频
+          try {
+            remoteVideoRef.current.muted = false;
+            remoteVideoRef.current.volume = 1;
+            remoteVideoRef.current.play().catch(() => undefined);
+          } catch (_) {}
           audioFactory?.setStream(stream);
           setStatus('Remote audio stream connected');
           setRemoteState({ streamActive: true });
@@ -825,7 +874,7 @@ export default function RTCClient({ room }: RTCClientProps) {
 
             <div className="bg-white rounded-lg shadow p-4">
               <h3 className="text-lg font-semibold text-gray-800 mb-3">Remote Audio</h3>
-              <video ref={remoteVideoRef} autoPlay muted className="w-full h-32 bg-gray-100 rounded border-2 border-gray-200" />
+              <video ref={remoteVideoRef} autoPlay className="w-full h-32 bg-gray-100 rounded border-2 border-gray-200" />
               <p className="text-sm text-gray-500 mt-2">Remote audio stream</p>
               <div className="mt-3 text-xs text-gray-600 flex items-center space-x-2">
                 <span className="font-semibold">Remote</span>
