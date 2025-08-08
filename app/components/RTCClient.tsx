@@ -139,9 +139,14 @@ export default function RTCClient({ room }: RTCClientProps) {
   const [permissionGranted, setPermissionGranted] = useState(false);
   const [permissionDenied, setPermissionDenied] = useState(false);
   const [roomUrl, setRoomUrl] = useState('');
+  // 设备列表与选择
+  const [devices, setDevices] = useState<{ mics: MediaDeviceInfo[]; cams: MediaDeviceInfo[] }>({ mics: [], cams: [] });
+  const [selectedMicId, setSelectedMicId] = useState<string>('');
+  const [selectedCamId, setSelectedCamId] = useState<string>('');
 
   const audioFactoryRef = useRef<AudioFactory | null>(null);
   const pcRef = useRef<RTCPeerConnection | null>(null);
+  const localStreamRef = useRef<MediaStream | null>(null);
   const droneRef = useRef<any>(null);
   const roomRef = useRef<any>(null);
   const pendingRemoteCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
@@ -175,6 +180,180 @@ export default function RTCClient({ room }: RTCClientProps) {
     if (rMeterCtxRef.current) {
       try { rMeterCtxRef.current.close(); } catch {}
       rMeterCtxRef.current = null;
+    }
+  };
+
+  // 枚举设备并初始化默认选择
+  const enumerateDevices = async () => {
+    try {
+      const list = await navigator.mediaDevices.enumerateDevices();
+      const mics = list.filter((d) => d.kind === 'audioinput');
+      const cams = list.filter((d) => d.kind === 'videoinput');
+      setDevices({ mics, cams });
+      if (!selectedMicId && mics.length > 0) setSelectedMicId(mics[0].deviceId || '');
+      if (!selectedCamId && cams.length > 0) setSelectedCamId(cams[0].deviceId || '');
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.warn('enumerateDevices failed', e);
+    }
+  };
+
+  useEffect(() => {
+    if (!permissionGranted) return;
+    enumerateDevices();
+    const handler = () => enumerateDevices();
+    try {
+      navigator.mediaDevices.addEventListener('devicechange', handler);
+      return () => navigator.mediaDevices.removeEventListener('devicechange', handler);
+    } catch (_) {
+      // Safari 旧版可能不支持 addEventListener，这里忽略
+      return undefined;
+    }
+  }, [permissionGranted]);
+
+  // 根据选择构建约束
+  const buildGumConstraints = () => {
+    const audio: MediaTrackConstraints | boolean = selectedMicId
+      ? {
+          deviceId: { exact: selectedMicId },
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          sampleRate: { ideal: 16000 },
+          channelCount: { ideal: 2 },
+        }
+      : {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          sampleRate: { ideal: 16000 },
+          channelCount: { ideal: 2 },
+        };
+    const video: MediaTrackConstraints | boolean = selectedCamId
+      ? {
+          deviceId: { exact: selectedCamId },
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+          frameRate: { ideal: 30 },
+          facingMode: 'user',
+        }
+      : {
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+          frameRate: { ideal: 30 },
+          facingMode: 'user',
+        };
+    return { audio, video } as MediaStreamConstraints;
+  };
+
+  // 刷新编码工厂以适配新的本地/远端流
+  const refreshAudioFactory = (local: MediaStream | null, remote: MediaStream | null) => {
+    try {
+      audioFactoryRef.current?.cleanup();
+    } catch {}
+    const factory = new AudioFactory();
+    factory.setOnAudioContextReady((sr) => setEncodeState((s) => ({ ...s, contextSampleRate: sr })));
+    factory.setOnEncoderReady((sr) => setEncodeState((s) => ({ ...s, encoderSampleRate: sr })));
+    factory.setOnWorkerChunk(() => setEncodeState((s) => ({ ...s, chunkCount: s.chunkCount + 1 })));
+    audioFactoryRef.current = factory;
+    if (local) factory.setStream(local);
+    if (remote) factory.setStream(remote);
+  };
+
+  // 切换本地设备并替换发送轨
+  const updateLocalTracks = async (kind?: 'audio' | 'video') => {
+    try {
+      const constraints = buildGumConstraints();
+      let newStream: MediaStream | null = null;
+      try {
+        newStream = await navigator.mediaDevices.getUserMedia(constraints);
+      } catch (_) {
+        // 回退：只请求变化的轨道
+        if (kind === 'audio') {
+          newStream = await navigator.mediaDevices.getUserMedia({ audio: constraints.audio, video: false });
+        } else if (kind === 'video') {
+          newStream = await navigator.mediaDevices.getUserMedia({ video: constraints.video, audio: false });
+        } else {
+          newStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        }
+      }
+      if (!newStream) return;
+
+      const pc = pcRef.current;
+      const oldStream = localStreamRef.current;
+
+      const newAudio = newStream.getAudioTracks()[0] || null;
+      const newVideo = newStream.getVideoTracks()[0] || null;
+
+      // 替换发送端轨道
+      if (pc) {
+        const senders = pc.getSenders();
+        if (newAudio) {
+          const aSender = senders.find((s) => s.track && s.track.kind === 'audio');
+          await aSender?.replaceTrack(newAudio);
+        }
+        if (newVideo) {
+          const vSender = senders.find((s) => s.track && s.track.kind === 'video');
+          await vSender?.replaceTrack(newVideo);
+        }
+      }
+
+      // 更新本地展示流，尽量复用旧的 MediaStream 容器
+      let targetStream = oldStream || new MediaStream();
+      if (oldStream) {
+        // 移除旧轨并停止
+        if (kind !== 'video') {
+          oldStream.getAudioTracks().forEach((t) => { t.stop(); oldStream.removeTrack(t); });
+        }
+        if (kind !== 'audio') {
+          oldStream.getVideoTracks().forEach((t) => { t.stop(); oldStream.removeTrack(t); });
+        }
+      }
+      if (newAudio) targetStream.addTrack(newAudio);
+      if (newVideo) targetStream.addTrack(newVideo);
+      localStreamRef.current = targetStream;
+      if (localVideoRef.current) localVideoRef.current.srcObject = targetStream;
+
+      // 重启本地音量计
+      if (newAudio) {
+        try {
+          cleanupMeter();
+          const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+          const source = ctx.createMediaStreamSource(targetStream);
+          const analyser = ctx.createAnalyser();
+          analyser.fftSize = 512;
+          analyser.smoothingTimeConstant = 0.2;
+          source.connect(analyser);
+          meterCtxRef.current = ctx;
+          meterAnalyserRef.current = analyser;
+          const data = new Uint8Array(analyser.fftSize);
+          const tick = () => {
+            if (!meterAnalyserRef.current) return;
+            meterAnalyserRef.current.getByteTimeDomainData(data);
+            let sum = 0;
+            for (let i = 0; i < data.length; i++) {
+              const v = (data[i] - 128) / 128;
+              sum += v * v;
+            }
+            const rms = Math.sqrt(sum / data.length);
+            const level = Math.min(1, rms * 2.5);
+            setLocalState((s) => ({ ...s, micLevel: level, streamActive: true }));
+            meterRafRef.current = requestAnimationFrame(tick);
+          };
+          meterRafRef.current = requestAnimationFrame(tick);
+        } catch (e) {
+          // eslint-disable-next-line no-console
+          console.warn('restart meter failed', e);
+        }
+      }
+
+      // 让编码工厂使用最新的本地/远端流
+      const remoteStream = (remoteVideoRef.current?.srcObject || null) as MediaStream | null;
+      refreshAudioFactory(targetStream, remoteStream);
+
+      setStatus('Device switched');
+    } catch (e: any) {
+      setStatus(`Switch device failed: ${e?.message || 'Unknown'}`);
     }
   };
 
@@ -331,7 +510,7 @@ export default function RTCClient({ room }: RTCClientProps) {
           // 远端音量检测
           try {
             cleanupRemoteMeter();
-            const rctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+          const rctx = new (window.AudioContext || (window as any).webkitAudioContext)();
             const rsource = rctx.createMediaStreamSource(stream);
             const ranalyser = rctx.createAnalyser();
             ranalyser.fftSize = 512;
@@ -379,23 +558,10 @@ export default function RTCClient({ room }: RTCClientProps) {
       const getMediaStream = async () => {
         try {
           setStatus('Getting media stream...');
-          let stream: MediaStream;
+      let stream: MediaStream;
           try {
-            stream = await navigator.mediaDevices.getUserMedia({
-              audio: {
-                echoCancellation: true,
-                noiseSuppression: true,
-                autoGainControl: true,
-                sampleRate: { ideal: 16000 },
-                channelCount: { ideal: 2 },
-              },
-              video: {
-                width: { ideal: 1280 },
-                height: { ideal: 720 },
-                frameRate: { ideal: 30 },
-                facingMode: 'user',
-              },
-            });
+            // 使用当前选择的设备生成约束
+            stream = await navigator.mediaDevices.getUserMedia(buildGumConstraints());
           } catch (_) {
             // 回退：仅音频
             stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -403,6 +569,7 @@ export default function RTCClient({ room }: RTCClientProps) {
           const audioTracks = stream.getAudioTracks();
           if (audioTracks.length === 0) throw new Error('No audio track found');
           if (localVideoRef.current) localVideoRef.current.srcObject = stream;
+          localStreamRef.current = stream;
           stream.getTracks().forEach((track) => pc.addTrack(track, stream));
           audioFactory?.setStream(stream);
           setStatus('Local audio stream connected');
@@ -412,7 +579,7 @@ export default function RTCClient({ room }: RTCClientProps) {
           try {
             cleanupMeter();
             const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
-            const source = ctx.createMediaStreamSource(stream);
+            const source = ctx.createMediaStreamSource(localStreamRef.current || stream);
             const analyser = ctx.createAnalyser();
             analyser.fftSize = 512;
             analyser.smoothingTimeConstant = 0.2;
@@ -480,6 +647,8 @@ export default function RTCClient({ room }: RTCClientProps) {
           if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null as any;
           setRemoteState({ streamActive: false, micLevel: 0 });
           cleanupRemoteMeter();
+          // 远端断开时仅保留本地流到编码工厂
+          refreshAudioFactory(localStreamRef.current, null);
         }
       });
 
@@ -672,6 +841,45 @@ export default function RTCClient({ room }: RTCClientProps) {
                 />
               </div>
             </div>
+          </div>
+          {/* 设备选择区 */}
+          <div className="bg-white rounded-lg shadow p-4 mt-6">
+            <h3 className="text-lg font-semibold text-gray-800 mb-3">Device Selection</h3>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div>
+                <label className="block text-sm text-gray-600 mb-1">Microphone</label>
+                <select
+                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm bg-gray-50"
+                  value={selectedMicId}
+                  onChange={(e) => {
+                    setSelectedMicId(e.target.value);
+                    updateLocalTracks('audio');
+                  }}
+                >
+                  {devices.mics.length === 0 && <option value="">No microphone</option>}
+                  {devices.mics.map((d) => (
+                    <option key={d.deviceId} value={d.deviceId}>{d.label || `Mic ${d.deviceId.slice(0, 6)}`}</option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="block text-sm text-gray-600 mb-1">Camera</label>
+                <select
+                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm bg-gray-50"
+                  value={selectedCamId}
+                  onChange={(e) => {
+                    setSelectedCamId(e.target.value);
+                    updateLocalTracks('video');
+                  }}
+                >
+                  {devices.cams.length === 0 && <option value="">No camera</option>}
+                  {devices.cams.map((d) => (
+                    <option key={d.deviceId} value={d.deviceId}>{d.label || `Cam ${d.deviceId.slice(0, 6)}`}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
+            <div className="text-xs text-gray-500 mt-2">切换设备将无中断地替换发送轨道，远端连接保持。</div>
           </div>
         </div>
       </div>
