@@ -122,6 +122,7 @@ export default function RTCClient({ room }: RTCClientProps) {
   }>({ micGranted: false, deviceReady: false, streamActive: false });
   const [remoteState, setRemoteState] = useState<{
     streamActive: boolean;
+    micLevel?: number;
   }>({ streamActive: false });
   const [rtcState, setRtcState] = useState<{
     signaling: 'idle' | 'open' | 'error';
@@ -158,6 +159,22 @@ export default function RTCClient({ room }: RTCClientProps) {
     if (meterCtxRef.current) {
       try { meterCtxRef.current.close(); } catch {}
       meterCtxRef.current = null;
+    }
+  };
+  // 远端音量检测资源
+  const rMeterCtxRef = useRef<AudioContext | null>(null);
+  const rMeterAnalyserRef = useRef<AnalyserNode | null>(null);
+  const rMeterRafRef = useRef<number | null>(null);
+  const cleanupRemoteMeter = () => {
+    if (rMeterRafRef.current) {
+      cancelAnimationFrame(rMeterRafRef.current);
+      rMeterRafRef.current = null;
+    }
+    try { rMeterAnalyserRef.current?.disconnect(); } catch {}
+    rMeterAnalyserRef.current = null;
+    if (rMeterCtxRef.current) {
+      try { rMeterCtxRef.current.close(); } catch {}
+      rMeterCtxRef.current = null;
     }
   };
 
@@ -294,6 +311,36 @@ export default function RTCClient({ room }: RTCClientProps) {
           audioFactory?.setStream(stream);
           setStatus('Remote audio stream connected');
           setRemoteState({ streamActive: true });
+          // 远端音量检测
+          try {
+            cleanupRemoteMeter();
+            const rctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+            const rsource = rctx.createMediaStreamSource(stream);
+            const ranalyser = rctx.createAnalyser();
+            ranalyser.fftSize = 512;
+            ranalyser.smoothingTimeConstant = 0.2;
+            rsource.connect(ranalyser);
+            rMeterCtxRef.current = rctx;
+            rMeterAnalyserRef.current = ranalyser;
+            const rdata = new Uint8Array(ranalyser.fftSize);
+            const rtick = () => {
+              if (!rMeterAnalyserRef.current) return;
+              rMeterAnalyserRef.current.getByteTimeDomainData(rdata);
+              let sum = 0;
+              for (let i = 0; i < rdata.length; i++) {
+                const v = (rdata[i] - 128) / 128;
+                sum += v * v;
+              }
+              const rms = Math.sqrt(sum / rdata.length);
+              const level = Math.min(1, rms * 2.5);
+              setRemoteState((s) => ({ ...s, micLevel: level, streamActive: true }));
+              rMeterRafRef.current = requestAnimationFrame(rtick);
+            };
+            rMeterRafRef.current = requestAnimationFrame(rtick);
+          } catch (e) {
+            // eslint-disable-next-line no-console
+            console.warn('Remote level meter init failed:', e);
+          }
         }
       };
 
@@ -429,6 +476,7 @@ export default function RTCClient({ room }: RTCClientProps) {
       pcRef.current?.close();
       try { droneRef.current?.close?.(); } catch (_) {}
       cleanupMeter();
+      cleanupRemoteMeter();
     };
   };
 
@@ -577,6 +625,13 @@ export default function RTCClient({ room }: RTCClientProps) {
                 <span className={remoteState.streamActive ? 'text-green-600' : 'text-yellow-600'}>
                   {remoteState.streamActive ? 'streaming' : 'idle'}
                 </span>
+              </div>
+              {/* 远端音量条 */}
+              <div className="mt-2 h-2 bg-gray-200 rounded">
+                <div
+                  className="h-2 bg-blue-500 rounded transition-[width] duration-75"
+                  style={{ width: `${Math.round(((remoteState.micLevel || 0) * 100))}%` }}
+                />
               </div>
             </div>
           </div>
