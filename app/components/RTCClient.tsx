@@ -296,6 +296,23 @@ export default function RTCClient({ room }: RTCClientProps) {
         const state = pc.connectionState;
         setRtcState((s) => ({ ...s, pcState: state }));
         if (state === 'connected') setStatus('Peer connected');
+        if (state === 'disconnected' || state === 'failed' || state === 'closed') {
+          // 远端离开/异常，更新远端状态与清理音量检测
+          setStatus('Peer disconnected');
+          if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null as any;
+          setRemoteState({ streamActive: false, micLevel: 0 });
+          cleanupRemoteMeter();
+        }
+      };
+
+      pc.oniceconnectionstatechange = () => {
+        const ice = pc.iceConnectionState;
+        setRtcState((s) => ({ ...s, iceState: ice }));
+        if (ice === 'disconnected' || ice === 'failed' || ice === 'closed') {
+          if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null as any;
+          setRemoteState({ streamActive: false, micLevel: 0 });
+          cleanupRemoteMeter();
+        }
       };
 
       if (isOfferer) {
@@ -341,6 +358,21 @@ export default function RTCClient({ room }: RTCClientProps) {
             // eslint-disable-next-line no-console
             console.warn('Remote level meter init failed:', e);
           }
+
+          // 监听远端 track 结束/静音
+          stream.getTracks().forEach((t) => {
+            t.addEventListener('ended', () => {
+              setRemoteState({ streamActive: false, micLevel: 0 });
+              cleanupRemoteMeter();
+              if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null as any;
+            });
+            t.addEventListener('mute', () => {
+              setRemoteState((s) => ({ ...s, micLevel: 0 }));
+            });
+            t.addEventListener('unmute', () => {
+              // 恢复时由 analyser 驱动更新
+            });
+          });
         }
       };
 
@@ -443,6 +475,12 @@ export default function RTCClient({ room }: RTCClientProps) {
         const isOfferer = members.length >= 2;
         if (!pcRef.current) startWebRTC(isOfferer);
         setStatus(`Room members: ${members.length}, ${isOfferer ? 'Initiator' : 'Receiver'}`);
+        if (members.length < 2) {
+          // 房间只剩本地，认为远端已离开
+          if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null as any;
+          setRemoteState({ streamActive: false, micLevel: 0 });
+          cleanupRemoteMeter();
+        }
       });
 
       roomObj.on('data', (message: any, member: any) => {
